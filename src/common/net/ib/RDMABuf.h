@@ -351,7 +351,11 @@ class RDMABufPool : public std::enable_shared_from_this<RDMABufPool>, folly::Mov
 }  // namespace hf3fs::net
 
 template <>
+#ifdef __clang__
 struct ::hf3fs::serde::SerdeMethod<::hf3fs::net::RDMARemoteBuf> {
+#else  // gcc rejects a global-qualified class name here
+struct hf3fs::serde::SerdeMethod<hf3fs::net::RDMARemoteBuf> {
+#endif
   static constexpr auto serialize(const net::RDMARemoteBuf &buf, auto &out) {
     uint8_t len = 0;
     for (auto &rkey : buf.rkeys()) {

@@ -1,5 +1,9 @@
 #pragma once
 
+#ifndef __clang__
+#include <vector>
+#endif
+
 #include "common/serde/CallContext.h"
 #include "common/serde/Echo.h"
 #include "common/serde/Service.h"
@@ -11,7 +15,14 @@ namespace hf3fs::serde {
 
 class Services {
  public:
-  Services() { addService(std::make_unique<echo::ServiceImpl>(), true); }
+  Services() {
+#ifndef __clang__
+    for (auto &services : services_) {
+      services.resize(65536);
+    }
+#endif
+    addService(std::make_unique<echo::ServiceImpl>(), true);
+  }
 
   template <class Service>
   Result<Void> addService(std::unique_ptr<Service> &&obj, bool isRDMA) {
@@ -35,7 +46,13 @@ class Services {
 
  private:
   ConstructLog<"serde::Services"> constructLog_;
+#ifdef __clang__
   std::array<CallContext::ServiceWrapper, 65536> services_[2];  // 0 for TCP, 1 for RDMA.
+#else
+  // 0 for TCP, 1 for RDMA. A vector (65536 each) instead of std::array: gcc fully unrolls the array's
+  // default construction into a ~5MB constructor and takes minutes to compile it.
+  std::vector<CallContext::ServiceWrapper> services_[2];
+#endif
 };
 
 }  // namespace hf3fs::serde

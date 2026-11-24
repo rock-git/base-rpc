@@ -7,7 +7,7 @@ RDMA 用例自动 skip），`examples/echo` 跑通，`scripts/check_deps.py` 通
 - 不带 `GitVersion.cmake` / `VersionInfo.cc.in`：`VersionInfo` 在拷贝的代码里只被 include、从未调用。
 - 不带 `Target.cmake`，顶层 `CMakeLists.txt` 自己定义 `base-rpc` 目标。
 - 补充的文件：`common/utils/Toml.cc`（Toml.hpp 的实现，只被 .hpp 配对，原脚本漏掉）、`compat/gtest/gtest_prod.h`。
-- 必须用 clang 编译（`Serde.h/.cc` 里的写法 gcc 不接受）；`-msse4.2 -mavx2` 需要和 folly 一致，由顶层工程全局添加。
+- 已支持 gcc 13（全量编译 + ctest 通过）和 clang；gcc 15 编译 CallContext.h 会内部错误（ICE）。改动见 README 差异表；`-msse4.2 -mavx2` 需要和 folly 一致，由顶层工程全局添加。
 - 测试：IB 目录单独成 `test_base_rpc_ib`，默认只编译不注册 ctest（`-DBASE_RPC_RUN_IB_TESTS=ON` 才注册）。
 - 未做：真实 RDMA 机器上的测试（本机没有可用 RDMA 设备）、纯 TCP 构建（仍需 libibverbs）、install/find_package。
 

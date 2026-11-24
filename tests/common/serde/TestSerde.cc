@@ -19,7 +19,11 @@ struct CheckString {
 };
 
 struct Demo {
+#ifdef __clang__
   SERDE_CLASS_FIELD(a, short{10}, [](short a) { return a > 0; });  // checker is lambda expr.
+#else  // gcc parses the `>` as the end of a template argument list
+  SERDE_CLASS_FIELD(a, short{10}, [](short a) { return (a > 0); });  // checker is lambda expr.
+#endif
   SERDE_CLASS_FIELD(b, 20.0f, checkValue);                         // checker is function pointer.
   SERDE_CLASS_FIELD(c, std::string{"ok"}, CheckString{});          // checker is function object.
 };

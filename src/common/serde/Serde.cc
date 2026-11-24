@@ -20,6 +20,20 @@ struct TomlObject : public toml::value {
   using basic_value::basic_value;
 };
 
+// clang: 3FS's original definition. gcc rejects `template <> template <> ... add(auto &&)`, so spell out the
+// member template parameter.
+#ifdef __clang__
+#define HF3FS_OUT_ADD_DEFINITION(T) \
+  template <>                       \
+  template <>                       \
+  void Out<T>::add(auto &&v)
+#else
+#define HF3FS_OUT_ADD_DEFINITION(T) \
+  template <>                       \
+  template <class U>                \
+  void Out<T>::add(U &&v)
+#endif
+
 template <>
 Out<JsonObject>::Out() = default;
 template <>
@@ -51,9 +65,7 @@ void Out<JsonObject>::value(Optional has) {
   }
 }
 
-template <>
-template <>
-void Out<JsonObject>::add(auto &&v) {
+HF3FS_OUT_ADD_DEFINITION(JsonObject) {
   if (inArray()) {  // in array.
     root_.back().push_back(std::forward<decltype(v)>(v));
   } else if (inTable()) {  // in table.
@@ -97,9 +109,7 @@ void Out<TomlObject>::arrayBegin() {
   root_.emplace_back(TomlObject::array_type{});
 }
 
-template <>
-template <>
-void Out<TomlObject>::add(auto &&v) {
+HF3FS_OUT_ADD_DEFINITION(TomlObject) {
   using T = decltype(v);
   if (inArray()) {  // in array.
     root_.back().push_back(std::forward<T>(v));

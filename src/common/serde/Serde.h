@@ -879,14 +879,22 @@ concept Serializable = requires(const T &o) {
 }  // namespace hf3fs::serde
 
 template <>
+#ifdef __clang__
 struct ::hf3fs::serde::SerdeMethod<::hf3fs::Void> {
+#else  // gcc rejects a global-qualified class name here
+struct hf3fs::serde::SerdeMethod<hf3fs::Void> {
+#endif
   static constexpr auto serialize(Void, auto &&) {}                 // DO NOTHING.
   static Result<Void> deserialize(Void, auto &) { return Void{}; }  // DO NOTHING.
   static constexpr std::string_view serdeToReadable(Void) { return "Void"; };
 };
 
 template <>
+#ifdef __clang__
 struct ::hf3fs::serde::SerdeMethod<::hf3fs::Status> {
+#else  // gcc rejects a global-qualified class name here
+struct hf3fs::serde::SerdeMethod<hf3fs::Status> {
+#endif
   static constexpr auto serialize(const Status &status, auto &out) {
     std::optional<std::string_view> msg = std::nullopt;
     if (!status.message().empty()) {
@@ -928,7 +936,11 @@ struct ::hf3fs::serde::SerdeMethod<::hf3fs::Status> {
 };
 
 template <class T>
+#ifdef __clang__
 struct ::hf3fs::serde::SerdeMethod<::hf3fs::Result<T>> {
+#else  // gcc rejects a global-qualified class name here
+struct hf3fs::serde::SerdeMethod<hf3fs::Result<T>> {
+#endif
   static auto serialize(const ::hf3fs::Result<T> &result, auto &out) {
     bool hasValue = result.hasValue();
     if (hasValue) {

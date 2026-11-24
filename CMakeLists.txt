@@ -95,7 +95,7 @@ target_include_directories(base-rpc PUBLIC ${PROJECT_SOURCE_DIR}/src ${PROJECT_S
 target_link_libraries(base-rpc PUBLIC folly scn::scn toml11 libzstd_static ${IBVERBS_LIBRARY} Threads::Threads)
 target_compile_options(base-rpc PRIVATE -Wall -Wextra)
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  # Serde.cc has `template <> template <>` which clang >= 19 reports as an error by default.
+  # Serde.cc keeps 3FS's `template <> template <>` form for clang, which clang >= 19 reports as an error by default.
   target_compile_options(base-rpc PRIVATE -Wno-extraneous-template-head)
 endif()
 
