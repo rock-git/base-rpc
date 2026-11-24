@@ -1,0 +1,7 @@
+// Same guard and macro as googletest's gtest_prod.h, so base-rpc headers (FRIEND_TEST) do not need gtest installed.
+#ifndef GOOGLETEST_INCLUDE_GTEST_GTEST_PROD_H_
+#define GOOGLETEST_INCLUDE_GTEST_GTEST_PROD_H_
+
+#define FRIEND_TEST(test_case_name, test_name) friend class test_case_name##_##test_name##_Test
+
+#endif  // GOOGLETEST_INCLUDE_GTEST_GTEST_PROD_H_
