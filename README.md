@@ -54,7 +54,7 @@ Copied files are unchanged except the following. The gcc workarounds sit behind 
 | `common/serde/Services.h` | clang keeps the `std::array`; other compilers use a `std::vector` for `services_` (gcc unrolled the array construction into a 5MB constructor, compile took minutes) |
 | `common/serde/SerdeHelper.h` | removed `store/load/snapshotLoad` (KV transaction helpers) |
 | `common/net/Server.{h,cc}` | no `AppInfo`: `start()` takes no argument, no `appInfo()` |
-| `common/net/{Transport,Processor,ServiceGroup,IOWorker,TransportPool}.h`, `Transport.cc`, `Server.cc` | same-port HTTP status pages (`processor.enable_http`, default off), see `docs/http-sniff.md` |
+| `common/net/{Transport,Processor,ServiceGroup,IOWorker,TransportPool}.h`, `Transport.cc`, `Server.cc` | same-port HTTP status pages (`processor.enable_http`, default off), see `docs/http-sniff.md`; HEAD/POST (`processor.http_max_body_size`), see `docs/http-post-head.md` |
 | `common/net/http/Http.{h,cc}`, `tests/common/net/TestHttp.cc` | new |
 | `common/net/ServiceGroupInfo.{h,cc}` | new, `flat::ServiceGroupInfo` copied from `common/app/AppInfo.h` |
 | `common/monitor/{Recorder,Sample}.h` | **shim**: all metrics are no-ops |

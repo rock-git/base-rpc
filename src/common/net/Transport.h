@@ -104,7 +104,7 @@ class Transport : public EventLoop::EventHandler, public hf3fs::enable_shared_fr
   // wake up when read/write/poll finished.
   void wakeUpAfterLastReadAndWriteFinished(uint32_t flags);
 
-  // serve one HTTP GET from readBuff_. false: headers incomplete, read more. true: replied and closed.
+  // serve one HTTP request from readBuff_. false: headers or body incomplete, read more. true: replied and closed.
   bool doHttp();
 
  private:
@@ -129,6 +129,7 @@ class Transport : public EventLoop::EventHandler, public hf3fs::enable_shared_fr
   std::atomic<RelativeTime> lastUsedTime_ = RelativeTime::now();
 
   // for read.
+  bool sent100_ = false;  // "100 Continue" is sent at most once per connection.
   IOBufPtr readBuff_ = MessageWrapper::allocate(kMessageReadBufferSize);
   // protocol sniffed from the first byte, only touched by the read task.
   enum class Proto : uint8_t { Unknown, Serde, Http };

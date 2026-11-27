@@ -1,6 +1,8 @@
-// HTTP/1.1 GET server on the RPC TCP port (docs/http-sniff.md), for checking the protocol with curl.
+// HTTP/1.1 GET/HEAD/POST server on the RPC TCP port (docs/http-sniff.md, docs/http-post-head.md), for checking with curl.
 //   server: http_server --port=8000
 //   curl -i http://127.0.0.1:8000/ping
+//   curl -I http://127.0.0.1:8000/ping
+//   curl -d hello http://127.0.0.1:8000/echo
 #include <atomic>
 #include <csignal>
 #include <folly/init/Init.h>
@@ -30,11 +32,20 @@ int main(int argc, char *argv[]) {
 
   static std::atomic<uint64_t> count{0};
   auto &group = *server.groups().front();
-  group.addHttpRoute("/ping", [] { return net::Processor::HttpResponse{.body = "pong\n"}; });
-  group.addHttpRoute("/json", [] {
+  group.addHttpRoute("/ping", [](const net::http::Request &) { return net::Processor::HttpResponse{.body = "pong\n"}; });
+  group.addHttpRoute("/json", [](const net::http::Request &) {
     return net::Processor::HttpResponse{.contentType = "application/json", .body = "{\"ok\":true}\n"};
   });
-  group.addHttpRoute("/count", [] { return net::Processor::HttpResponse{.body = std::to_string(++count) + "\n"}; });
+  group.addHttpRoute("/count", [](const net::http::Request &) { return net::Processor::HttpResponse{.body = std::to_string(++count) + "\n"}; });
+
+  // small response on purpose: replies must fit in the socket send buffer.
+  group.addHttpRoute(
+      "/echo",
+      [](const net::http::Request &req) {
+        return net::Processor::HttpResponse{.body = std::to_string(req.body.size()) + " " +
+                                                    std::string(req.body.substr(0, 64)) + "\n"};
+      },
+      true);
 
   if (auto r = server.setup(); r.hasError()) {
     std::cerr << "setup failed: " << r.error().describe() << std::endl;

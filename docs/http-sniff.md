@@ -12,7 +12,7 @@
 非目标（本期不做）：
 - 不支持 RDMA transport 上的 HTTP（RDMA 连接只走 serde）。
 - 不支持 UNIX domain socket 上的 HTTP。
-- 不做 keep-alive、chunked、POST、HTTPS、鉴权、gzip。
+- 不做 keep-alive、chunked、HTTPS、鉴权、gzip。`HEAD` 和 `POST` 见 [`http-post-head.md`](http-post-head.md)。
 - 不做大响应（见 §6 风险 1）。
 
 ## 2. 现状
@@ -64,7 +64,7 @@ if (UNLIKELY(proto_ != Proto::Serde)) {
 
 `doHttp()` 返回 `bool`（true = 已回复并关闭，false = 需要更多数据），行为：
 1. `http::parseRequest(buf, tailroom()==0, req)`：返回 `0` 表示请求头未收全，`doHttp` 返回 false；缓冲区满（32KB）仍无 `\r\n\r\n` 返回 `431`（缓冲区满时 `recv` 返回 0，若不处理会被误当作 EAGAIN 挂起）；请求行格式错返回 `400`；成功返回 `200` 并填好 `http::Request`。
-2. 解析成功交给 `ioWorker_.processor_.handleHttp(req)`（`Transport` 是 `IOWorker` 的 friend，见 §4.2）：方法不是 `GET` 回 `405`，未注册路径回 `404`；失败则 `http::Response::error(status, reasonPhrase)`。
+2. 解析成功交给 `ioWorker_.processor_.handleHttp(req)`（`Transport` 是 `IOWorker` 的 friend，见 §4.2）：方法不是 `GET` 回 `405`，未注册路径回 `404`（后续扩展了 `HEAD`/`POST`，见 [`http-post-head.md`](http-post-head.md)）；失败则 `http::Response::error(status, reasonPhrase)`。
 3. `http::formatResponse(rsp)` 生成 `HTTP/1.1 <status>\r\nContent-Type: ...\r\nContent-Length: ...\r\nConnection: close\r\n\r\n<body>`，在 `doHttp` 里直接一次 `socket_->send` 发出，然后关闭：
    ```cpp
    invalidate(false);                                        // 不打 WARNING 日志

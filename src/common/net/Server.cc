@@ -35,8 +35,8 @@ Result<Void> Server::setup() {
 Result<Void> Server::start() {
   // default pages first, so beforeStart() can override them. routes must be in place before the groups start.
   for (auto &group : groups_) {
-    group->addHttpRoute("/server", [this] { return Processor::HttpResponse{.body = describe()}; });
-    group->addHttpRoute("/connections", [&ioWorker = group->ioWorker()] {
+    group->addHttpRoute("/server", [this](const http::Request &) { return Processor::HttpResponse{.body = describe()}; });
+    group->addHttpRoute("/connections", [&ioWorker = group->ioWorker()](const http::Request &) {
       constexpr size_t kMaxRows = 200;  // keep the page within the socket send buffer.
       size_t total = 0;
       std::string rows;

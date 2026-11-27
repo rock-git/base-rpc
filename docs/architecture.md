@@ -747,7 +747,7 @@ stateDiagram-v2
 
 ### 5.1 同端口 HTTP(`enable_http`)
 
-服务端 TCP 连接的第一次 `doRead` 看首字节:`0x86/0x87` 走 serde,其他在 `Processor::Config::enable_http=true` 时走 `Transport::doHttp`,只处理一条 `GET` 请求,内联回包后 `invalidate(false)` 关连接;请求头未收全时回到读循环,由 `tryToSuspend` 挂起。解析/序列化在 `common/net/http/Http.{h,cc}`,路由由 `ServiceGroup::addHttpRoute` 注册,`Server` 默认提供 `/`、`/server`、`/connections`。详见 `docs/http-sniff.md`。
+服务端 TCP 连接的第一次 `doRead` 看首字节:`0x86/0x87` 走 serde,其他在 `Processor::Config::enable_http=true` 时走 `Transport::doHttp`,只处理一条 `GET`/`HEAD`/`POST` 请求(POST 需路由 `allowPost`,body 靠 `Content-Length` 读完、上限 `http_max_body_size`),内联回包后 `invalidate(false)` 关连接;请求头或 body 未收全时回到读循环,由 `tryToSuspend` 挂起。解析/序列化在 `common/net/http/Http.{h,cc}`,路由由 `ServiceGroup::addHttpRoute` 注册,`Server` 默认提供 `/`、`/server`、`/connections`。详见 `docs/http-sniff.md`、`docs/http-post-head.md`。
 
 ## 6. RDMA 实现(`common/net/ib`)
 

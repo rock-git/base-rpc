@@ -42,10 +42,12 @@ class Processor {
     CONFIG_HOT_UPDATED_ITEM(unpack_inline_max_size, 0_B);
     // serve read-only HTTP GET pages on the TCP port of this group (first byte sniffing, see docs/http-sniff.md).
     CONFIG_HOT_UPDATED_ITEM(enable_http, false);
+    // max HTTP request body (Content-Length), larger requests get 413, see docs/http-post-head.md.
+    CONFIG_HOT_UPDATED_ITEM(http_max_body_size, 16_MB);
   };
 
   using HttpResponse = http::Response;
-  using HttpHandler = std::function<HttpResponse()>;
+  using HttpHandler = std::function<HttpResponse(const http::Request &)>;
 
   struct Job {
     IOBufPtr buf;
@@ -74,22 +76,34 @@ class Processor {
   void setCoroutinesPoolGetter(auto &&g) { coroutinesPoolGetter_ = std::forward<decltype(g)>(g); }
 
   // register before the group starts: routes are read without a lock afterwards.
-  void addHttpRoute(std::string path, HttpHandler handler) {
-    httpRoutes_.insert_or_assign(std::move(path), std::move(handler));
+  // routes always serve GET and HEAD, POST only if `allowPost`.
+  void addHttpRoute(std::string path, HttpHandler handler, bool allowPost = false) {
+    httpRoutes_.insert_or_assign(std::move(path), HttpRoute{std::move(handler), allowPost});
   }
 
   bool httpEnabled() const { return config_.enable_http(); }
+  size_t httpMaxBodySize() const { return config_.http_max_body_size(); }
 
-  // dispatch a parsed request. non-blocking, may run in the epoll thread. "/" lists the routes unless registered.
-  HttpResponse handleHttp(const http::Request &req) const {
-    if (req.method != "GET") {
-      return HttpResponse::error(405, "only GET is supported");
-    }
-    if (auto it = httpRoutes_.find(req.path); it != httpRoutes_.end()) {
-      return it->second();
-    }
-    if (req.path != "/") {
+  // called once the request headers are complete, before reading the body. returns the error to reply, if any.
+  std::optional<HttpResponse> checkHttp(const http::Request &req) const {
+    auto it = httpRoutes_.find(req.path);
+    if (it == httpRoutes_.end() && req.path != "/") {
       return HttpResponse::error(404, "not found");
+    }
+    bool allowPost = it != httpRoutes_.end() && it->second.allowPost;
+    if (req.method == "GET" || req.method == "HEAD" || (allowPost && req.method == "POST")) {
+      return std::nullopt;
+    }
+    auto rsp = HttpResponse::error(405, "method not allowed");
+    rsp.allow = allowPost ? "GET, HEAD, POST" : "GET, HEAD";
+    return rsp;
+  }
+
+  // dispatch a request that passed checkHttp, with the complete body. non-blocking, may run in the epoll thread.
+  // HEAD is served like GET (Transport drops the body). "/" lists the routes unless registered.
+  HttpResponse handleHttp(const http::Request &req) const {
+    if (auto it = httpRoutes_.find(req.path); it != httpRoutes_.end()) {
+      return it->second.handler(req);
     }
     HttpResponse rsp;
     for (auto &[route, _] : httpRoutes_) {
@@ -254,7 +268,11 @@ class Processor {
   const Config &config_;
   using CoroutinesPoolGetter = std::function<DynamicCoroutinesPool &(const serde::MessagePacket<> &)>;
   CoroutinesPoolGetter coroutinesPoolGetter_{};
-  std::map<std::string, HttpHandler, std::less<>> httpRoutes_;
+  struct HttpRoute {
+    HttpHandler handler;
+    bool allowPost;
+  };
+  std::map<std::string, HttpRoute, std::less<>> httpRoutes_;
 
   constexpr static size_t kStopFlag = 1;
   constexpr static size_t kFrozenTCP = 2;

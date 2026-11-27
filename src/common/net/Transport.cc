@@ -8,7 +8,9 @@
 #include <folly/experimental/coro/Sleep.h>
 #include <folly/logging/xlog.h>
 #include <iostream>
+#include <cstring>
 #include <memory>
+#include <optional>
 #include <random>
 #include <thread>
 
@@ -269,14 +271,46 @@ void Transport::doRead(bool error, bool logError /* = true */) {
 
 bool Transport::doHttp() {
   std::string_view buf(reinterpret_cast<const char *>(readBuff_->data()), readBuff_->length());
-  // a full buffer makes recv return 0, which would otherwise be taken as EAGAIN and hang: parseRequest gives 431.
+  // a full buffer with incomplete headers makes recv return 0, which would be taken as EAGAIN and hang: 431.
   http::Request req;
   auto status = http::parseRequest(buf, readBuff_->tailroom() == 0, req);
-  if (status == 0) {
+  if (status == 0 && req.headerSize == 0) {
     return false;
   }
-  auto rsp = status == 200 ? ioWorker_.processor_.handleHttp(req) : http::Response::error(status, std::string(http::reasonPhrase(status)));
-  auto text = http::formatResponse(rsp);
+  auto &processor = ioWorker_.processor_;
+  std::optional<http::Response> rsp;
+  if (status != 0 && status != 200) {
+    rsp = http::Response::error(status, std::string(http::reasonPhrase(status)));
+  } else if (rsp = processor.checkHttp(req); rsp) {
+    // 404/405 before reading the body.
+  } else if (req.contentLength > processor.httpMaxBodySize()) {
+    rsp = http::Response::error(413, std::string(http::reasonPhrase(413)));
+  } else if (status == 0) {
+    // headers are fine, body incomplete.
+    if (req.expect100 && !sent100_ && readBuff_->length() == req.headerSize) {
+      constexpr std::string_view kContinue = "HTTP/1.1 100 Continue\r\n\r\n";
+      struct iovec iov {
+        const_cast<char *>(kContinue.data()), kContinue.size()
+      };
+      socket_->send(&iov, 1);
+      sent100_ = true;
+    }
+    if (readBuff_->tailroom() == 0) {
+      // double, but never beyond the declared size: a bare large Content-Length costs nothing.
+      auto size = std::min(2 * readBuff_->capacity(), req.headerSize + req.contentLength);
+      auto newBuf = MessageWrapper::allocate(size);
+      ::memcpy(newBuf->writableBuffer(), readBuff_->data(), readBuff_->length());
+      newBuf->append(readBuff_->length());
+      readBuff_ = std::move(newBuf);
+    }
+    return false;
+  } else {
+    rsp = processor.handleHttp(req);
+  }
+  auto text = http::formatResponse(*rsp);
+  if (req.method == "HEAD") {
+    text.resize(text.size() - rsp->body.size());  // Content-Length stays.
+  }
   // shortcut: raw send, response must fit in the socket send buffer (tens of KB on default tcp_wmem); switch to a
   // WriteItem variant for large pages.
   struct iovec iov {
