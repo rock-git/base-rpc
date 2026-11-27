@@ -1,5 +1,7 @@
 # base-rpc
 
+English | [中文](README.zh-CN.md)
+
 Network and RPC library extracted from [3FS](https://github.com/deepseek-ai/3FS) (MIT, see `LICENSE`):
 `common/net` (TCP / RDMA / unix transports, event loop, server, client) and `common/serde`
 (serialization and the `SERDE_SERVICE` RPC framework), plus the few `common/utils` pieces they need.
