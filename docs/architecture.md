@@ -745,6 +745,10 @@ stateDiagram-v2
   Closed --> [*]
 ```
 
+### 5.1 同端口 HTTP(`enable_http`)
+
+服务端 TCP 连接的第一次 `doRead` 看首字节:`0x86/0x87` 走 serde,其他在 `Processor::Config::enable_http=true` 时走 `Transport::doHttp`,只处理一条 `GET` 请求,内联回包后 `invalidate(false)` 关连接;请求头未收全时回到读循环,由 `tryToSuspend` 挂起。解析/序列化在 `common/net/http/Http.{h,cc}`,路由由 `ServiceGroup::addHttpRoute` 注册,`Server` 默认提供 `/`、`/server`、`/connections`。详见 `docs/http-sniff.md`。
+
 ## 6. RDMA 实现(`common/net/ib`)
 
 核心思路:**用 RDMA 的 SEND/RECV 模拟 TCP 字节流承载 RPC(控制面),用单边 READ/WRITE 传大块数据(数据面)**。`IBSocket` 继承 `Socket`,与 `TcpSocket` 接口一致,上层 `Transport / IOWorker / EventLoop / Processor` 不区分协议。
