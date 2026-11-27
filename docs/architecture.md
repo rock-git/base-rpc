@@ -744,3 +744,144 @@ stateDiagram-v2
   Invalidated --> Closed: 读写任务都 Finished → clearPendingRequestsOnTransportFailure
   Closed --> [*]
 ```
+
+## 6. RDMA 实现(`common/net/ib`)
+
+核心思路:**用 RDMA 的 SEND/RECV 模拟 TCP 字节流承载 RPC(控制面),用单边 READ/WRITE 传大块数据(数据面)**。`IBSocket` 继承 `Socket`,与 `TcpSocket` 接口一致,上层 `Transport / IOWorker / EventLoop / Processor` 不区分协议。
+
+### 6.1 分层与数据通路
+
+```mermaid
+flowchart TB
+  H["业务 handler<br/>CallContext"]
+  TR[Transport]
+  EL["EventLoop (epoll)"]
+  CON["IBConnectService<br/>TCP 带外建连"]
+  IBS[IBSocket]
+  DEV["IBDevice / PD / MR"]
+  BUF["RDMABuf / RDMABufPool"]
+  QP[("RC QP / CQ")]
+
+  H -->|"RPC 控制面"| TR --> IBS
+  H -->|"read/writeTransmission 数据面"| IBS
+  EL -.->|"comp_channel fd"| IBS
+  CON -->|"accept / 交换 QP 信息"| IBS
+  IBS --> DEV
+  IBS --> BUF
+  IBS ==>|"SEND/RECV + IMM(ACK/CLOSE)"| QP
+  IBS ==>|"RDMA READ/WRITE"| QP
+```
+
+### 6.2 建连时序(TCP 带外交换 QP 信息)
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant C as Client IBSocket
+  participant CT as Client TCP ClientContext
+  participant ST as Server IBConnectService (TCP)
+  participant S as Server IBSocket
+  participant IOW as Server IOWorker
+
+  C->>CT: IBConnect::query
+  CT->>ST: query(IBQueryReq)
+  ST-->>C: 设备/端口/zone 列表
+  C->>C: selectDevice(zone 匹配 + round-robin)
+  C->>C: qpCreate: comp_channel + CQ + RC QP + 注册收发 MR
+  C->>C: qpInit: QP RESET→INIT   (state=CONNECTING)
+  C->>ST: connect(IBConnectReq: qp_num, lid/gid, mtu, IBConnectConfig)
+  ST->>S: new IBSocket + accept(req)
+  S->>S: qpCreate → INIT → RTR, 预 post 全部 recv buf (state=ACCEPTED)
+  ST->>IOW: accept_(socket) → addIBSocket (加入 epoll)
+  ST-->>C: IBConnectRsp(服务端 qp_num, lid/gid, mtu)
+  C->>C: qpReadyToRecv: RTR + 预 post 全部 recv buf
+  C->>C: qpReadyToSend: RTS
+  C->>S: SEND_WITH_IMM(ACK(0)) connect probe
+  S->>S: onRecved: ACCEPTED → qpReadyToSend → READY
+  C->>C: 探针 WC 完成: CONNECTING → READY
+  Note over C,S: 此后 RPC 报文走 SEND/RECV, 大数据走单边 READ/WRITE
+```
+
+### 6.3 小消息通路(SEND/RECV 模拟字节流 + credit 流控)
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant TA as Transport(发送侧)
+  participant A as IBSocket A
+  participant NIC as RDMA NIC / 对端
+  participant B as IBSocket B
+  participant TB as Transport(接收侧)
+
+  TA->>A: send(iov): memcpy 进 sendBufs_[i]
+  Note over A: buf 写满 或 flush() 才 postSend<br/>每 buf_signal_batch(8) 个设 SIGNALED
+  A->>NIC: ibv_post_send(SEND)
+  NIC->>B: 数据落入预 post 的 recv buf
+  B->>B: CQ 事件 → comp_channel fd 可读 → epoll
+  B->>B: poll(): get_cq_event → poll_cq → req_notify_cq → 再 poll_cq
+  B->>B: onRecved → RecvBuffers.push, 事件 Readable
+  B->>TB: recv() 拷出, postRecv(idx) 归还 buf
+  loop 每消费 buf_ack_batch(8) 个 buf
+    B->>NIC: SEND_WITH_IMM(ACK(8))
+    NIC->>A: onImmData: sendAcked_ += 8
+  end
+  A->>A: poll(): min(sendAcked_, sendSignaled_) 个 buf 可复用
+  A->>TA: 事件 Writable (sendBufs_.push)
+```
+
+### 6.4 单边 RDMA READ/WRITE(handler 零拷贝读写对端内存)
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant CL as Client
+  participant SV as Server Processor / handler
+  participant LIM as Client RDMAControl 限流器
+  participant IBS as Server IBSocket
+  participant NIC as Server NIC
+  participant CM as Client 内存(MR)
+
+  CL->>CL: RDMABuf::allocate / pool → toRemoteBuf() (addr,len,rkeys)
+  CL->>SV: RPC 请求(含 RDMARemoteBuf, flags=ControlRDMA)
+  SV->>SV: handler: tx = ctx.writeTransmission() / readTransmission()
+  SV->>SV: tx.add(remoteBuf, localBuf)
+  opt ControlRDMA 限流
+    SV->>LIM: RDMAControl::apply(uuid) (反向 RPC)
+    LIM->>LIM: Semaphore 排队 (max_concurrent_transmission=64)
+    LIM-->>SV: 放行
+  end
+  SV->>IBS: co_await tx.post() → rdmaBatch
+  IBS->>IBS: 按 max_rdma_wr_per_post(32) 拆分, rdmaSem_ 限制在途 WR
+  IBS->>NIC: ibv_post_send(WR 链, 仅最后一个 SIGNALED, wr_id=RDMAPostCtx*)
+  NIC->>CM: 单边 DMA(远端 CPU 不参与)
+  NIC-->>IBS: WC(RDMA_LAST)
+  IBS->>IBS: onRDMAFinished → ctx.baton.post()
+  IBS-->>SV: 协程恢复 (status != SUCCESS → kRDMAError)
+  SV-->>CL: RPC 响应
+```
+
+### 6.5 IBSocket 状态机与关闭
+
+```mermaid
+stateDiagram-v2
+  [*] --> INIT
+  INIT --> CONNECTING: 客户端 qpInit 完成
+  INIT --> ACCEPTED: 服务端 accept (已到 RTR)
+  CONNECTING --> READY: 探针 SEND 的 WC 完成
+  ACCEPTED --> READY: 收到对端首条消息, qpReadyToSend
+  READY --> CLOSE: 收到 IMM(CLOSE)
+  READY --> ERROR: WC 状态错误 / post 失败 / QP ERR
+  CONNECTING --> ERROR
+  ACCEPTED --> ERROR: rdma_accept_timeout
+  CLOSE --> [*]: Drainer 在 drain_timeout 内排空 CQ 后销毁 QP
+  ERROR --> [*]
+```
+
+### 6.6 要点
+
+- **流控**:接收方每消费 `buf_ack_batch` 个 buf 回一个 `SEND_WITH_IMM(ACK(n))`,发送方只复用「已 signaled 且已 ack」的 buf,保证对端 RQ 不会 RNR。
+- **WR 预留**:`qpMaxSendWR = send_buf_cnt + ackBufs + max_rdma_wr + close + check`,CQ 容量为 SendWR + RecvWR,按此预分配以避免溢出。
+- **`wr_id` 编码**:`StampedPtr` 把「类型 + 指针/索引」打包进 64 位,类型有 `SEND/RECV/ACK/RDMA/RDMA_LAST/CLOSE/CHECK`;`RDMA_LAST` 直接携带 `RDMAPostCtx*`,完成时 `baton.post()` 唤醒协程。
+- **内存**:`RDMABuf` 每设备一个 MR,`RDMARemoteBuf`(addr, len, 每设备 rkey)可 serde 后随 RPC 发给对端;`RDMABufPool` 复用已注册 buf,避免频繁 `reg_mr`。
+- **限流**:`RDMAControl`(service id 10)由数据持有方用信号量限制并发传输数(默认 64),防止 incast。
+- **配置**:`IBSocket::Config` / `rdma_connect_timeout` 等均为热更新配置项。
