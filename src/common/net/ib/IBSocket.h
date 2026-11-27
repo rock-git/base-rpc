@@ -134,6 +134,12 @@ class IBSocket : public Socket, folly::MoveOnly {
   int fd() const override { return channel_->fd; }
 
   Result<Events> poll(uint32_t events) override;
+  // poll the CQ without the completion channel (busy-poll mode). `arm` requests a CQ notification, `polled` returns
+  // the number of WCs.
+  Result<Events> pollCQ(bool arm, size_t &polled);
+  // switch to busy-poll mode: `poll` no longer re-arms the CQ, the busy-poll loop arms it before sleeping.
+  // must be called before the socket joins an event loop.
+  void setBusyPoll() { busyPoll_ = true; }
 
   Result<size_t> send(folly::ByteRange buf);
   Result<size_t> send(struct iovec *iov, uint32_t cnt) override;
@@ -458,7 +464,7 @@ class IBSocket : public Socket, folly::MoveOnly {
 
   Result<Void> checkState();
 
-  void cqPoll(Events &events);
+  size_t cqPoll(Events &events);
   int cqGetEvent();
   int cqRequestNotify();
   void wcError(const ibv_wc &wc);
@@ -532,6 +538,7 @@ class IBSocket : public Socket, folly::MoveOnly {
   std::atomic<bool> closed_ = false;
   std::atomic<bool> closeMsgSended_ = false;
   size_t unackedEvents_ = 0;
+  bool busyPoll_ = false;
 
   // memory
   std::optional<BufferMem> mem_;

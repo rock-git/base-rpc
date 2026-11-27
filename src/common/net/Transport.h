@@ -93,6 +93,10 @@ class Transport : public EventLoop::EventHandler, public hf3fs::enable_shared_fr
   int fd() const final { return socket_->fd(); }
   // handle the events notified by epoll. [EventHandler]
   void handleEvents(uint32_t epollEvents) final;
+  // poll the CQ directly in a busy-poll loop, RDMA only. [EventHandler]
+  bool busyPoll(bool arm) final;
+  // start read/write tasks for the events returned by the socket poll.
+  void onPolled(const Result<Socket::Events> &results);
 
   // wake up when read/write/poll finished.
   void wakeUpAfterLastReadAndWriteFinished(uint32_t flags);

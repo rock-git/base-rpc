@@ -2,6 +2,8 @@
 
 #include <folly/Random.h>
 #include <folly/logging/xlog.h>
+#include <folly/portability/Asm.h>
+#include <pthread.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 
@@ -10,7 +12,8 @@
 
 namespace hf3fs::net {
 
-Result<Void> EventLoop::start(const std::string &threadName) {
+Result<Void> EventLoop::start(const std::string &threadName, BusyPollOptions busy) {
+  busy_ = busy;
   // 1. init epoll fd.
   epfd_ = ::epoll_create(16_KB);
   if (UNLIKELY(!epfd_.valid())) {
@@ -35,8 +38,15 @@ Result<Void> EventLoop::start(const std::string &threadName) {
   }
 
   // 4. start loop in background thread.
-  thread_ = std::jthread(&EventLoop::loop, this);
+  thread_ = std::jthread(busy_.enable ? &EventLoop::busyLoop : &EventLoop::loop, this);
   folly::setThreadName(thread_.get_id(), threadName);
+  if (busy_.cpu >= 0) {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(busy_.cpu, &set);
+    int ret = ::pthread_setaffinity_np(thread_.native_handle(), sizeof(set), &set);
+    XLOGF_IF(WARN, ret != 0, "EventLoop {} failed to pin to cpu {}, error {}", threadName, busy_.cpu, ret);
+  }
   return Void{};
 }
 
@@ -67,6 +77,7 @@ Result<Void> EventLoop::add(const std::shared_ptr<EventHandler> &handler, uint32
     handler->it_ = wrapperList_.begin();
     handler->eventLoop_ = weak_from_this();
     wrapper = &wrapperList_.front();
+    ++version_;
   }
 
   struct epoll_event event;
@@ -128,35 +139,98 @@ void EventLoop::loop() {
       break;
     }
 
-    // 2. handle events.
-    for (int i = 0; i < n; ++i) {
-      auto &evt = events[i];
-      if (evt.data.ptr == nullptr) {
-        // waked up by event fd. read all.
-        uint64_t val;
-        while (::read(eventfd_, &val, sizeof(val)) > 0) {
-        }
-        continue;
-      }
-
-      auto wrapper = reinterpret_cast<HandlerWrapper *>(evt.data.ptr);
-      if (auto handler = wrapper->handler.lock()) {
-        handler->handleEvents(evt.events);
-      }
-    }
-
-    // 3. handle remove.
-    if (!deleteQueue_.empty()) {
-      auto lock = std::unique_lock(mutex_);
-      std::list<HandlerWrapper>::iterator it;
-      // limit the number of deletions in a single iteration.
-      for (auto i = 0ul; i < kDeleteQueueWakeUpLoopThreshold && deleteQueue_.try_dequeue(it); ++i) {
-        wrapperList_.erase(it);
-      }
-    }
+    dispatch(events, n);
+    processDeletes();
   }
 
   XLOGF(INFO, "EventLoop::loop() stopped.");
+}
+
+void EventLoop::busyLoop() {
+  XLOGF(INFO, "EventLoop::busyLoop() started, idle {}us.", busy_.idle.count());
+
+  // wrappers are only erased in this thread (processDeletes), so the raw pointers stay valid until the next refresh.
+  std::vector<HandlerWrapper *> handlers;
+  uint64_t seenVersion = ~0ull;
+  auto pollAll = [&](bool arm) {
+    bool work = false;
+    for (auto wrapper : handlers) {
+      if (auto handler = wrapper->handler.lock()) {
+        work |= handler->busyPoll(arm);
+      }
+    }
+    return work;
+  };
+
+  auto lastWork = std::chrono::steady_clock::now();
+  while (!stop_) {
+    if (auto version = version_.load(std::memory_order_acquire); version != seenVersion) {
+      auto lock = std::unique_lock(mutex_);
+      seenVersion = version;
+      handlers.clear();
+      for (auto &wrapper : wrapperList_) {
+        handlers.push_back(&wrapper);
+      }
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    if (pollAll(false)) {
+      lastWork = now;
+    } else if (busy_.idle.count() == 0 || now - lastWork < busy_.idle) {
+      folly::asm_volatile_pause();
+    } else if (pollAll(true)) {
+      // work arrived while arming, keep spinning.
+      // shortcut: handlers armed here stay armed while spinning, costing at most one spurious interrupt per sleep.
+      lastWork = now;
+    } else {
+      constexpr int kMaxEvents = 64;
+      struct epoll_event events[kMaxEvents];
+      int n = ::epoll_wait(epfd_, events, kMaxEvents, -1);
+      if (n == -1) {
+        XLOGF_IF(ERR, errno != EINTR, "epoll_wait failed, errno {}, retry", errno);
+        continue;
+      }
+      dispatch(events, n);
+      lastWork = std::chrono::steady_clock::now();
+    }
+
+    if (processDeletes()) {
+      seenVersion = ~0ull;
+    }
+  }
+
+  XLOGF(INFO, "EventLoop::busyLoop() stopped.");
+}
+
+void EventLoop::dispatch(struct epoll_event *events, int n) {
+  for (int i = 0; i < n; ++i) {
+    auto &evt = events[i];
+    if (evt.data.ptr == nullptr) {
+      // waked up by event fd. read all.
+      uint64_t val;
+      while (::read(eventfd_, &val, sizeof(val)) > 0) {
+      }
+      continue;
+    }
+
+    auto wrapper = reinterpret_cast<HandlerWrapper *>(evt.data.ptr);
+    if (auto handler = wrapper->handler.lock()) {
+      handler->handleEvents(evt.events);
+    }
+  }
+}
+
+bool EventLoop::processDeletes() {
+  if (deleteQueue_.empty()) {
+    return false;
+  }
+  auto lock = std::unique_lock(mutex_);
+  std::list<HandlerWrapper>::iterator it;
+  // limit the number of deletions in a single iteration.
+  for (auto i = 0ul; i < kDeleteQueueWakeUpLoopThreshold && deleteQueue_.try_dequeue(it); ++i) {
+    wrapperList_.erase(it);
+  }
+  return true;
 }
 
 EventLoopPool::EventLoopPool(size_t numThreads)
@@ -166,10 +240,15 @@ EventLoopPool::EventLoopPool(size_t numThreads)
   }
 }
 
-Result<Void> EventLoopPool::start(const std::string &threadName) {
+Result<Void> EventLoopPool::start(const std::string &threadName,
+                                  BusyPollOptions busy,
+                                  std::vector<uint32_t> cpus) {
   int idx = 0;
   for (auto &eventLoop : eventLoops_) {
-    RETURN_AND_LOG_ON_ERROR(eventLoop->start(threadName + std::to_string(idx++)));
+    if (!cpus.empty()) {
+      busy.cpu = cpus[idx % cpus.size()];
+    }
+    RETURN_AND_LOG_ON_ERROR(eventLoop->start(threadName + std::to_string(idx++), busy));
   }
   return Void{};
 }

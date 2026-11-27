@@ -10,7 +10,17 @@
 
 namespace hf3fs::net {
 
-Result<Void> IOWorker::start(const std::string &name) { return eventLoopPool_.start(name + "EL"); }
+Result<Void> IOWorker::start(const std::string &name) {
+  RETURN_AND_LOG_ON_ERROR(eventLoopPool_.start(name + "EL"));
+  if (config_.rdma_poll_mode() != RDMAPollMode::EVENT) {
+    auto idle = config_.rdma_poll_mode() == RDMAPollMode::HYBRID ? config_.busy_poll_idle_us() : 0u;
+    rdmaPollers_.emplace(config_.num_rdma_pollers());
+    RETURN_AND_LOG_ON_ERROR(rdmaPollers_->start(name + "BP",
+                                                {.enable = true, .idle = std::chrono::microseconds(idle)},
+                                                config_.rdma_poller_cpus()));
+  }
+  return Void{};
+}
 
 void IOWorker::stopAndJoin() {
   auto flags = flags_.fetch_or(kStopFlag);
@@ -21,6 +31,9 @@ void IOWorker::stopAndJoin() {
   }
 
   eventLoopPool_.stopAndJoin();
+  if (rdmaPollers_) {
+    rdmaPollers_->stopAndJoin();
+  }
   dropConnections(true, true);
   connExecutorShared_.store(std::shared_ptr<folly::Executor::KeepAlive<>>());
 }
@@ -48,13 +61,21 @@ Result<TransportPtr> IOWorker::addIBSocket(std::unique_ptr<IBSocket> sock) {
 
   pool_.add(transport);
 
-  auto result = eventLoopPool_.add(transport, (EPOLLIN | EPOLLOUT | EPOLLET));
+  auto result = addToEventLoop(transport);
   if (UNLIKELY(!result)) {
     pool_.remove(transport);
     RETURN_AND_LOG_ON_ERROR(result);
   }
 
   return Result<TransportPtr>(std::move(transport));
+}
+
+Result<Void> IOWorker::addToEventLoop(const TransportPtr &transport) {
+  if (transport->isRDMA() && rdmaPollers_) {
+    transport->ibSocket()->setBusyPoll();
+    return rdmaPollers_->add(transport, (EPOLLIN | EPOLLOUT | EPOLLET));
+  }
+  return eventLoopPool_.add(transport, (EPOLLIN | EPOLLOUT | EPOLLET));
 }
 
 void IOWorker::sendAsync(Address addr, WriteList list) {
@@ -101,7 +122,7 @@ CoTryTask<void> IOWorker::startConnect(TransportPtr transport, Address addr) {
   } else {
     CO_RETURN_AND_LOG_ON_ERROR(co_await transport->connect(addr, config_.tcp_connect_timeout()));
   }
-  CO_RETURN_AND_LOG_ON_ERROR(eventLoopPool_.add(transport, (EPOLLIN | EPOLLOUT | EPOLLET)));
+  CO_RETURN_AND_LOG_ON_ERROR(addToEventLoop(transport));
 
   // connect successfully.
   guard.dismiss();
@@ -117,7 +138,7 @@ CoTryTask<void> IOWorker::waitAndRetry(Address addr, WriteList list) {
 
 void IOWorker::startReadTask(Transport *transport, bool error, bool logError /* = true */) {
   if ((transport->isTCP() && config_.read_write_tcp_in_event_thread()) ||
-      (transport->isRDMA() && config_.read_write_rdma_in_event_thread())) {
+      (transport->isRDMA() && (config_.read_write_rdma_in_event_thread() || rdmaBusyPoll()))) {
     transport->doRead(error, logError);
   } else {
     executor_.pickNextFree().add(
@@ -127,7 +148,7 @@ void IOWorker::startReadTask(Transport *transport, bool error, bool logError /* 
 
 void IOWorker::startWriteTask(Transport *transport, bool error, bool logError /* = true */) {
   if ((transport->isTCP() && config_.read_write_tcp_in_event_thread()) ||
-      (transport->isRDMA() && config_.read_write_rdma_in_event_thread())) {
+      (transport->isRDMA() && (config_.read_write_rdma_in_event_thread() || rdmaBusyPoll()))) {
     transport->doWrite(error, logError);
   } else {
     executor_.pickNextFree().add(

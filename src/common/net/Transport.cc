@@ -341,9 +341,21 @@ void Transport::tryToCleanUp(bool isWrite) {
   }
 }
 
-void Transport::handleEvents(uint32_t epollEvents) {
-  // 1. poll socket.
-  auto results = socket_->poll(epollEvents);
+void Transport::handleEvents(uint32_t epollEvents) { onPolled(socket_->poll(epollEvents)); }
+
+bool Transport::busyPoll(bool arm) {
+  // only RDMA transports join busy-poll loops (IOWorker::addToEventLoop).
+  size_t polled = 0;
+  auto results = static_cast<IBSocket *>(socket_.get())->pollCQ(arm, polled);
+  // keep polling after invalidation: flushed WCs still have to wake pending RDMA ops.
+  if (results.hasError() || results.value() != 0) {
+    onPolled(results);
+  }
+  return polled != 0;
+}
+
+void Transport::onPolled(const Result<Socket::Events> &results) {
+  // 1. poll result.
   bool error = results.hasError();
 
   // 2. construct mask from events of poll.

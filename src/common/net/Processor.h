@@ -34,6 +34,9 @@ class Processor {
     CONFIG_HOT_UPDATED_ITEM(enable_coroutines_pool, true);
     CONFIG_HOT_UPDATED_ITEM(response_compression_level, 1u);
     CONFIG_HOT_UPDATED_ITEM(response_compression_threshold, 128_KB);
+    // unpack a received batch in the IO thread instead of hopping to the proc pool if it is at most this size.
+    // 0 = always hop. handlers still run in the proc pool, so this only moves checksum/deserialize.
+    CONFIG_HOT_UPDATED_ITEM(unpack_inline_max_size, 0_B);
   };
 
   struct Job {
@@ -51,6 +54,8 @@ class Processor {
     auto num = processingRequestsNum(flags_.load(std::memory_order_acquire));
     if (UNLIKELY(num >= config_.max_processing_requests_num())) {
       XLOGF(WARN, "Too many processing requests: {}, unpack message in current thread.", num);
+      unpackMsg(wrapper, tr);
+    } else if (wrapper.length() <= config_.unpack_inline_max_size()) {
       unpackMsg(wrapper, tr);
     } else {
       executor_.pickNext().add(

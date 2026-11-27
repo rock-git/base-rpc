@@ -6,6 +6,8 @@
 #include <folly/executors/IOThreadPoolExecutor.h>
 #include <folly/net/NetworkSocket.h>
 #include <memory>
+#include <optional>
+#include <vector>
 
 #include "common/net/EventLoop.h"
 #include "common/net/Network.h"
@@ -19,6 +21,12 @@
 
 namespace hf3fs::net {
 
+// how RDMA transports learn about completions.
+//   EVENT:  comp_channel + epoll (interrupt per wakeup).
+//   BUSY:   dedicated poller threads spin on the CQs, never sleep.
+//   HYBRID: spin, and after `busy_poll_idle_us` without work arm the CQs and sleep in epoll.
+enum class RDMAPollMode { EVENT, BUSY, HYBRID };
+
 // A worker that handles all I/O tasks.
 class IOWorker {
  public:
@@ -29,6 +37,10 @@ class IOWorker {
     CONFIG_HOT_UPDATED_ITEM(rdma_connect_timeout, 5_s);
     CONFIG_HOT_UPDATED_ITEM(wait_to_retry_send, 100_ms);
     CONFIG_ITEM(num_event_loop, 1u);
+    CONFIG_ITEM(rdma_poll_mode, RDMAPollMode::EVENT);
+    CONFIG_ITEM(num_rdma_pollers, 1u, ConfigCheckers::checkPositive);
+    CONFIG_ITEM(busy_poll_idle_us, 100u);              // HYBRID only.
+    CONFIG_ITEM(rdma_poller_cpus, std::vector<uint32_t>{});  // pin poller i to cpus[i % size], empty = no pinning.
 
     CONFIG_OBJ(ibsocket, IBSocket::Config);
     CONFIG_OBJ(transport_pool, TransportPool::Config);
@@ -94,6 +106,10 @@ class IOWorker {
   // wait and retry.
   CoTryTask<void> waitAndRetry(Address addr, WriteList list);
 
+  // add a connected transport into an event loop, or a busy-poll loop for RDMA in BUSY/HYBRID mode.
+  Result<Void> addToEventLoop(const TransportPtr &transport);
+  bool rdmaBusyPoll() const { return rdmaPollers_.has_value(); }
+
   // start a `Transport::doRead` task in current thread or thread pool.
   void startReadTask(Transport *transport, bool error, bool logError = true);
   // start a `Transport::doWrite` task in current thread or thread pool.
@@ -119,6 +135,8 @@ class IOWorker {
   TransportPool pool_;
   // monitor I/O events for all transports.
   EventLoopPool eventLoopPool_;
+  // busy-poll loops for RDMA transports, created in `start` unless rdma_poll_mode is EVENT.
+  std::optional<EventLoopPool> rdmaPollers_;
 
   std::unique_ptr<ConfigCallbackGuard> ibsocketConfigGuard_;
 

@@ -1,16 +1,27 @@
 #pragma once
 
+#include <chrono>
 #include <folly/concurrency/UnboundedQueue.h>
 #include <list>
 #include <memory>
 #include <sys/epoll.h>
 #include <thread>
+#include <vector>
 
 #include "common/utils/FdWrapper.h"
 #include "common/utils/Result.h"
 #include "common/utils/TypeTraits.h"
 
 namespace hf3fs::net {
+
+// busy-poll mode: the loop spins on `EventHandler::busyPoll` instead of blocking in epoll.
+struct BusyPollOptions {
+  bool enable = false;
+  // keep spinning this long after the last work, then arm handlers and sleep in epoll. 0 = never sleep.
+  std::chrono::microseconds idle{0};
+  // pin the loop thread to this CPU, -1 = no pinning.
+  int cpu = -1;
+};
 
 // EventLoop provides a main loop that notifies EventHandler callback objects when I/O is ready on a file descriptor.
 class EventLoop : public hf3fs::enable_shared_from_this<EventLoop> {
@@ -23,7 +34,7 @@ class EventLoop : public hf3fs::enable_shared_from_this<EventLoop> {
   ~EventLoop() { stopAndJoin(); }
 
   // start and stop.
-  Result<Void> start(const std::string &threadName = "EventLoop");
+  Result<Void> start(const std::string &threadName = "EventLoop", BusyPollOptions busy = {});
   Result<Void> wakeUp();
   void stopAndJoin();
 
@@ -32,6 +43,9 @@ class EventLoop : public hf3fs::enable_shared_from_this<EventLoop> {
     virtual ~EventHandler() = default;
     virtual int fd() const = 0;
     virtual void handleEvents(uint32_t epollEvents) = 0;
+    // busy-poll loops only: poll without waiting for epoll. `arm` asks for an epoll notification on new work, it is
+    // set right before the loop sleeps. return true if any work was done, which keeps the loop spinning.
+    virtual bool busyPoll(bool /* arm */) { return false; }
 
    protected:
     friend class EventLoop;
@@ -51,16 +65,23 @@ class EventLoop : public hf3fs::enable_shared_from_this<EventLoop> {
   };
 
   void loop();
+  void busyLoop();
+  void dispatch(struct epoll_event *events, int n);
+  // erase removed handlers, return true if any was erased.
+  bool processDeletes();
 
  private:
   FdWrapper epfd_;
   FdWrapper eventfd_;
+  BusyPollOptions busy_;
 
   std::atomic<bool> stop_{false};
   std::jthread thread_;
 
   std::mutex mutex_;
   std::list<HandlerWrapper> wrapperList_;
+  // bumped by `add`, tells the busy loop to refresh its handler snapshot.
+  std::atomic<uint64_t> version_{0};
 
   // wake up the event loop to do deletion if the size of delete queue greater than this threshold.
   constexpr static size_t kDeleteQueueWakeUpLoopThreshold = 128u;
@@ -73,7 +94,7 @@ class EventLoopPool {
   EventLoopPool(size_t numThreads);
 
   // start and stop.
-  Result<Void> start(const std::string &threadName);
+  Result<Void> start(const std::string &threadName, BusyPollOptions busy = {}, std::vector<uint32_t> cpus = {});
   void stopAndJoin();
 
   // add a event handler with interest events into event loop.

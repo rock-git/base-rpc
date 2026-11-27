@@ -402,4 +402,59 @@ TEST_F(TestRDMA, ServerRestart) {
   }));
 }
 
+// the same traffic with completions polled by busy-poll loops instead of epoll, on both sides.
+template <RDMAPollMode Mode>
+class TestRDMAPollMode : public TestRDMA {
+ protected:
+  TestRDMAPollMode() {
+    for (auto *io : {&clientConfig_.io_worker(), &serverConfig_.groups(0).io_worker()}) {
+      io->set_rdma_poll_mode(Mode);
+      io->set_busy_poll_idle_us(50);
+      io->set_num_rdma_pollers(2);
+    }
+    serverConfig_.groups(0).processor().set_unpack_inline_max_size(4_KB);
+    clientConfig_.processor().set_unpack_inline_max_size(4_KB);
+  }
+};
+using TestRDMABusyPoll = TestRDMAPollMode<RDMAPollMode::BUSY>;
+using TestRDMAHybridPoll = TestRDMAPollMode<RDMAPollMode::HYBRID>;
+
+#define POLL_MODE_TESTS(Fixture)                                                             \
+  TEST_F(Fixture, Concurrent) {                                                              \
+    auto ctx = client_.serdeCtx(serverAddr());                                               \
+    folly::CPUThreadPoolExecutor exec(8);                                                    \
+    folly::coro::blockingWait(folly::coro::co_invoke([&]() -> CoTask<void> {                 \
+      RDMAService<> client;                                                                  \
+      co_await startMultiClient(&exec, 128, client, ctx, 512 << 10, 8, false, false, 3_s);   \
+      /* idle long enough for the hybrid loops to sleep, then wake them up again. */         \
+      co_await folly::coro::sleep(std::chrono::milliseconds(100));                           \
+      co_await runClient(client, ctx, 512 << 10, 8, false, false, 1_s);                      \
+    }));                                                                                     \
+  }                                                                                          \
+  TEST_F(Fixture, FaultInjectConcurrent) {                                                   \
+    auto ctx = client_.serdeCtx(serverAddr());                                               \
+    folly::CPUThreadPoolExecutor exec(8);                                                    \
+    folly::coro::blockingWait(folly::coro::co_invoke([&]() -> CoTask<void> {                 \
+      RDMAService<> client;                                                                  \
+      co_await startMultiClient(&exec, 128, client, ctx, 512 << 10, 8, true, true, 3_s);     \
+      co_await runClient(client, ctx, 512 << 10, 8, false, false, 1_s);                      \
+    }));                                                                                     \
+  }                                                                                          \
+  TEST_F(Fixture, ServerDropConnections) {                                                   \
+    auto opts = net::UserRequestOptions{};                                                   \
+    opts.sendRetryTimes = 0;                                                                 \
+    auto ctx = client_.serdeCtx(serverAddr());                                               \
+    folly::coro::blockingWait(folly::coro::co_invoke([&]() -> CoTask<void> {                 \
+      RDMAService<> client;                                                                  \
+      for (size_t i = 0; i < 3; i++) {                                                       \
+        serverDropConnections();                                                             \
+        co_await folly::coro::sleep(std::chrono::milliseconds(200));                         \
+        co_await runClient(client, ctx, 512 << 10, 8, false, false, 500_ms, opts);           \
+      }                                                                                      \
+    }));                                                                                     \
+  }
+
+POLL_MODE_TESTS(TestRDMABusyPoll)
+POLL_MODE_TESTS(TestRDMAHybridPoll)
+
 }  // namespace hf3fs::net

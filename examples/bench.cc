@@ -33,6 +33,10 @@ DEFINE_string(proc_strategy, "SHARED_QUEUE", "proc pool strategy: SHARED_QUEUE|S
 DEFINE_uint32(io_threads, 2, "io threads");
 DEFINE_uint32(bg_threads, 2, "client: threads that run the benchmark coroutines");
 DEFINE_uint32(coro_pool_threads, 0, "server: >0 handles requests in a DynamicCoroutinesPool with this many threads");
+DEFINE_string(rdma_poll_mode, "EVENT", "rdma completion polling: EVENT (epoll) | BUSY (spin) | HYBRID (spin, then sleep when idle)");
+DEFINE_uint32(busy_poll_idle_us, 100, "HYBRID: spin this long without work before sleeping in epoll");
+DEFINE_uint32(rdma_pollers, 1, "BUSY/HYBRID: number of poller threads");
+DEFINE_uint64(unpack_inline_max_size, 0, "unpack received batches up to this size in the io thread (0 = hop to proc pool)");
 DEFINE_bool(trace, true, "client: collect per-stage latency from the rpc timestamp (adds a small header to each packet)");
 
 using namespace hf3fs;
@@ -57,6 +61,14 @@ class EchoServiceImpl : public serde::ServiceWrapper<EchoServiceImpl, Echo> {
 
 static std::atomic<bool> gStop{false};
 static CPUExecutorGroup::ExecutorStrategy kProcStrategy;
+static net::RDMAPollMode kPollMode;
+
+static void setPolling(net::IOWorker::Config &io, net::Processor::Config &proc) {
+  io.set_rdma_poll_mode(kPollMode);
+  io.set_busy_poll_idle_us(FLAGS_busy_poll_idle_us);
+  io.set_num_rdma_pollers(FLAGS_rdma_pollers);
+  proc.set_unpack_inline_max_size(FLAGS_unpack_inline_max_size);
+}
 
 static int runServer(net::Address::Type type, net::Address bind) {
   net::Server::Config config;
@@ -78,6 +90,7 @@ static int runServer(net::Address::Type type, net::Address bind) {
   }
   config.groups(0).io_worker().set_read_write_tcp_in_event_thread(FLAGS_rw_in_event_thread);
   config.groups(0).io_worker().set_read_write_rdma_in_event_thread(FLAGS_rw_in_event_thread);
+  setPolling(config.groups(0).io_worker(), config.groups(0).processor());
   config.thread_pool().set_num_proc_threads(FLAGS_proc_threads);
   config.thread_pool().set_proc_thread_pool_stratetry(kProcStrategy);
   config.thread_pool().set_num_io_threads(FLAGS_io_threads);
@@ -130,6 +143,7 @@ static int runClient(net::Address addr) {
   net::Client::Config config;
   config.io_worker().set_read_write_tcp_in_event_thread(FLAGS_rw_in_event_thread);
   config.io_worker().set_read_write_rdma_in_event_thread(FLAGS_rw_in_event_thread);
+  setPolling(config.io_worker(), config.processor());
   config.thread_pool().set_num_proc_threads(FLAGS_proc_threads);
   config.thread_pool().set_proc_thread_pool_stratetry(kProcStrategy);
   config.thread_pool().set_num_io_threads(FLAGS_io_threads);
@@ -235,6 +249,12 @@ int main(int argc, char *argv[]) {
     return 1;
   }
   kProcStrategy = *strategy;
+  auto pollMode = magic_enum::enum_cast<net::RDMAPollMode>(FLAGS_rdma_poll_mode);
+  if (!pollMode) {
+    std::cerr << "invalid --rdma_poll_mode: " << FLAGS_rdma_poll_mode << std::endl;
+    return 1;
+  }
+  kPollMode = *pollMode;
   const auto type = FLAGS_proto == "rdma" ? net::Address::RDMA : net::Address::TCP;
   // the server's LOCAL network type only changes which NIC it listens on; clients connect over TCP.
   const auto serverType = FLAGS_proto == "local" ? net::Address::LOCAL : type;

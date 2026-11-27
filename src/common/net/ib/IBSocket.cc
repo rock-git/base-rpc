@@ -333,15 +333,22 @@ Result<IBSocket::Events> IBSocket::poll(uint32_t /* events */) {
   });
 
   // poll CQ
-  Events events = 0;
   if (UNLIKELY(cqGetEvent())) {
     return makeError(RPCCode::kSocketError);
   }
-  cqPoll(events);
-  if (UNLIKELY(cqRequestNotify())) {
-    return makeError(RPCCode::kSocketError);
+  size_t polled = 0;
+  return pollCQ(!busyPoll_, polled);
+}
+
+Result<IBSocket::Events> IBSocket::pollCQ(bool arm, size_t &polled) {
+  Events events = 0;
+  polled = cqPoll(events);
+  if (arm) {
+    if (UNLIKELY(cqRequestNotify())) {
+      return makeError(RPCCode::kSocketError);
+    }
+    polled += cqPoll(events);
   }
-  cqPoll(events);
 
   // check send buffer available
   auto sendAvailable = std::min(sendAcked_, sendSignaled_);
@@ -361,13 +368,15 @@ Result<IBSocket::Events> IBSocket::poll(uint32_t /* events */) {
   return events;
 }
 
-void IBSocket::cqPoll(Events &events) {
+size_t IBSocket::cqPoll(Events &events) {
   static constexpr int kPollCQBatch = 16;
   std::array<ibv_wc, kPollCQBatch> wcArr;
 
+  size_t polled = 0;
   int ret = 0;
   while ((ret = ibv_poll_cq(cq_.get(), kPollCQBatch, &wcArr[0])) > 0) {
     IBDBG("IBSocket {} get {} WCs", describe(), ret);
+    polled += ret;
     for (int i = 0; i < ret; i++) {
       const ibv_wc &wc = wcArr[i];
       if (UNLIKELY(wc.status != IBV_WC_SUCCESS)) {
@@ -386,6 +395,7 @@ void IBSocket::cqPoll(Events &events) {
     XLOGF(DFATAL, "IBSocket {} failed to poll CQ, errno {}", describe(), ret);
     pollCqFailed.addSample(1, {{"tag", folly::to<std::string>(ret)}});
   }
+  return polled;
 }
 
 int IBSocket::cqGetEvent() {
@@ -1115,6 +1125,10 @@ int IBSocket::rdmaPostWR(RDMAPostCtx &ctx) {
 }
 
 IBSocket::Drainer::Ptr IBSocket::Drainer::create(IBSocket::Ptr socket, std::weak_ptr<IBSocketManager> manager) {
+  // busy-poll mode leaves the CQ unarmed, arm it before the CLOSE WR so its completion wakes the drainer.
+  if (socket && socket->busyPoll_ && socket->cqRequestNotify() != 0) {
+    return {};
+  }
   if (!socket || !socket->closeGracefully()) {
     return {};
   }
