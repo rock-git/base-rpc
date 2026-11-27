@@ -18,6 +18,7 @@
 #include "common/net/Socket.h"
 #include "common/net/Waiter.h"
 #include "common/net/WriteItem.h"
+#include "common/net/http/Http.h"
 #include "common/net/ib/IBDevice.h"
 #include "common/net/ib/IBSocket.h"
 #include "common/net/tcp/TcpSocket.h"
@@ -220,6 +221,21 @@ void Transport::doRead(bool error, bool logError /* = true */) {
     batchReadSize.addSample(readSize);
     readBuff_->append(readSize);
 
+    if (UNLIKELY(proto_ != Proto::Serde)) {
+      if (proto_ == Proto::Unknown) {
+        bool http = isTCP() && !serverAddr_.isUNIX() && ioWorker_.processor_.httpEnabled() &&
+                    (readBuff_->data()[0] & 0xfeu) != kSerdeMessageMagicNum;
+        proto_ = http ? Proto::Http : Proto::Serde;
+      }
+      if (proto_ == Proto::Http) {
+        // must go back to recv/tryToSuspend when incomplete: kReadAvailableFlag is only cleared there (EPOLLET).
+        if (!doHttp()) {
+          continue;
+        }
+        return;
+      }
+    }
+
     MessageWrapper msgWrapper(std::move(readBuff_));
     while (msgWrapper.headerComplete()) {
       // check message size.
@@ -249,6 +265,31 @@ void Transport::doRead(bool error, bool logError /* = true */) {
       readBuff_ = msgWrapper.detach();
     }
   }
+}
+
+bool Transport::doHttp() {
+  std::string_view buf(reinterpret_cast<const char *>(readBuff_->data()), readBuff_->length());
+  // a full buffer makes recv return 0, which would otherwise be taken as EAGAIN and hang: parseRequest gives 431.
+  http::Request req;
+  auto status = http::parseRequest(buf, readBuff_->tailroom() == 0, req);
+  if (status == 0) {
+    return false;
+  }
+  auto rsp = status == 200 ? ioWorker_.processor_.handleHttp(req) : http::Response::error(status, std::string(http::reasonPhrase(status)));
+  auto text = http::formatResponse(rsp);
+  // shortcut: raw send, response must fit in the socket send buffer (tens of KB on default tcp_wmem); switch to a
+  // WriteItem variant for large pages.
+  struct iovec iov {
+    text.data(), text.size()
+  };
+  auto result = socket_->send(&iov, 1);
+  if (result.hasError() || result.value() < text.size()) {
+    XLOGF(WARNING, "transport {} http response truncated, {} bytes", describe(), text.size());
+  }
+
+  invalidate(false);
+  wakeUpAfterLastReadAndWriteFinished(flags_ |= kLastReadFinished);
+  return true;
 }
 
 void Transport::doWrite(bool error, bool logError /* = true */) {

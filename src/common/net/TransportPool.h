@@ -93,6 +93,17 @@ class TransportPool {
   // drop connetions to peer.
   void checkConnections(Address addr, Duration expiredTime);
 
+  // visit every transport under its shard lock, `visit` must not block. [thread-safe]
+  void forEach(auto &&visit) {
+    shards_.iterate([&](Map &map) {
+      for (auto &[addr, set] : map) {
+        for (auto &[tr, idx] : set.transports()) {
+          visit(tr);
+        }
+      }
+    });
+  }
+
  private:
   const Config &config_;
 

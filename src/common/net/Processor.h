@@ -4,12 +4,15 @@
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/experimental/coro/ViaIfAsync.h>
 #include <limits>
+#include <map>
+#include <string>
 #include <thread>
 
 #include "common/net/MessageHeader.h"
 #include "common/net/Network.h"
 #include "common/net/Transport.h"
 #include "common/net/Waiter.h"
+#include "common/net/http/Http.h"
 #include "common/serde/CallContext.h"
 #include "common/serde/MessagePacket.h"
 #include "common/serde/Serde.h"
@@ -37,7 +40,12 @@ class Processor {
     // unpack a received batch in the IO thread instead of hopping to the proc pool if it is at most this size.
     // 0 = always hop. handlers still run in the proc pool, so this only moves checksum/deserialize.
     CONFIG_HOT_UPDATED_ITEM(unpack_inline_max_size, 0_B);
+    // serve read-only HTTP GET pages on the TCP port of this group (first byte sniffing, see docs/http-sniff.md).
+    CONFIG_HOT_UPDATED_ITEM(enable_http, false);
   };
+
+  using HttpResponse = http::Response;
+  using HttpHandler = std::function<HttpResponse()>;
 
   struct Job {
     IOBufPtr buf;
@@ -64,6 +72,31 @@ class Processor {
   }
 
   void setCoroutinesPoolGetter(auto &&g) { coroutinesPoolGetter_ = std::forward<decltype(g)>(g); }
+
+  // register before the group starts: routes are read without a lock afterwards.
+  void addHttpRoute(std::string path, HttpHandler handler) {
+    httpRoutes_.insert_or_assign(std::move(path), std::move(handler));
+  }
+
+  bool httpEnabled() const { return config_.enable_http(); }
+
+  // dispatch a parsed request. non-blocking, may run in the epoll thread. "/" lists the routes unless registered.
+  HttpResponse handleHttp(const http::Request &req) const {
+    if (req.method != "GET") {
+      return HttpResponse::error(405, "only GET is supported");
+    }
+    if (auto it = httpRoutes_.find(req.path); it != httpRoutes_.end()) {
+      return it->second();
+    }
+    if (req.path != "/") {
+      return HttpResponse::error(404, "not found");
+    }
+    HttpResponse rsp;
+    for (auto &[route, _] : httpRoutes_) {
+      rsp.body += route + "\n";
+    }
+    return rsp;
+  }
 
   Result<Void> start(std::string_view = {}) { return Void{}; }
 
@@ -221,6 +254,7 @@ class Processor {
   const Config &config_;
   using CoroutinesPoolGetter = std::function<DynamicCoroutinesPool &(const serde::MessagePacket<> &)>;
   CoroutinesPoolGetter coroutinesPoolGetter_{};
+  std::map<std::string, HttpHandler, std::less<>> httpRoutes_;
 
   constexpr static size_t kStopFlag = 1;
   constexpr static size_t kFrozenTCP = 2;

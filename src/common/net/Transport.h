@@ -74,6 +74,9 @@ class Transport : public EventLoop::EventHandler, public hf3fs::enable_shared_fr
     return expiredTime != Duration::zero() && RelativeTime::now() >= lastUsedTime_.load() + expiredTime;
   }
 
+  // last time the read task ran.
+  RelativeTime lastUsedTime() const { return lastUsedTime_.load(); }
+
  protected:
   enum class Action { OK, Retry, Suspend, Fail };
   template <uint32_t CheckAndRemove, uint32_t WantToRemove, MethodName Name>
@@ -101,6 +104,9 @@ class Transport : public EventLoop::EventHandler, public hf3fs::enable_shared_fr
   // wake up when read/write/poll finished.
   void wakeUpAfterLastReadAndWriteFinished(uint32_t flags);
 
+  // serve one HTTP GET from readBuff_. false: headers incomplete, read more. true: replied and closed.
+  bool doHttp();
+
  private:
   friend class IOWorker;
 
@@ -124,6 +130,9 @@ class Transport : public EventLoop::EventHandler, public hf3fs::enable_shared_fr
 
   // for read.
   IOBufPtr readBuff_ = MessageWrapper::allocate(kMessageReadBufferSize);
+  // protocol sniffed from the first byte, only touched by the read task.
+  enum class Proto : uint8_t { Unknown, Serde, Http };
+  Proto proto_ = Proto::Unknown;
 
   // for UNIX domain socket.
   std::optional<struct ucred> credentials_;

@@ -64,6 +64,11 @@ class ServiceGroup : public folly::MoveOnly {
   // set coroutines pool getter for processor.
   void setCoroutinesPoolGetter(auto &&g) { processor_.setCoroutinesPoolGetter(std::forward<decltype(g)>(g)); }
 
+  // register an HTTP GET page, only before start().
+  void addHttpRoute(std::string path, Processor::HttpHandler handler) {
+    processor_.addHttpRoute(std::move(path), std::move(handler));
+  }
+
  protected:
   CoTask<void> checkConnectionsRegularly();
 

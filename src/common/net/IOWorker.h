@@ -93,6 +93,9 @@ class IOWorker {
   // drop connections to peer.
   void checkConnections(Address addr, Duration expiredTime) { return pool_.checkConnections(addr, expiredTime); }
 
+  // read-only access for status pages.
+  auto &pool() { return pool_; }
+
  protected:
   friend class Transport;
   // get a valid transport.
